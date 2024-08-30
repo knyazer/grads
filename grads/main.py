@@ -22,6 +22,7 @@ class Logger:
 
             wandb.login()  # type: ignore
             wandb.init(
+                name="default",
                 project="ugrads",
                 settings=wandb.Settings(code_dir="."),
                 save_code=True,
@@ -193,21 +194,8 @@ lyapunov_factors = lyapunov_factors[group_start:group_end]
 n = len(lyapunov_factors)
 print(f"Running with {lyapunov_factors}")
 num_epochs = 1000
-wandbs = [Logger(use_wandb=True) for lf in lyapunov_factors]
-for i, wandb in enumerate(wandbs):
-    wandb.init(
-        f"lf{lyapunov_factors[i]:.2f}-{lr}-{num_envs}-{truncation_length}",
-        config={
-            "learning_rate": lr,
-            "truncation_length": truncation_length,
-            "num_envs": num_envs,
-            "episode_length": episode_length,
-            "max_gradient_norm": max_gradient_norm,
-            "lyapunov_factor": lyapunov_factors[i],
-            "num_epochs": num_epochs,
-            "backend": backend,
-        },
-    )
+wandb = Logger(use_wandb=True)
+wandb.init(name="runs_{id}")
 
 
 def run(env=env):
@@ -241,11 +229,10 @@ def run(env=env):
             jnp.array(lyapunov_factors),
         )
         pbar.set_description(f"Reward: {rewards}")
-        for i, wandb in enumerate(wandbs):
-            wandb.log({"reward", rewards[i]})
 
-    for wandb in wandbs:
-        wandb.finish()
+        log_dict = {f"reward_{lyapunov_factors[i]}": reward for i, reward in enumerate(rewards)}
+        wandb.log(log_dict)
+
     return agent, metrics
 
 
