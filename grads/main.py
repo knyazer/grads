@@ -195,7 +195,7 @@ n = len(lyapunov_factors)
 print(f"Running with {lyapunov_factors}")
 num_epochs = 1000
 wandb = Logger(use_wandb=True)
-wandb.init(name="runs_{id}")
+wandb.init(name=f"runs_{args.id}")
 
 
 def run(env=env):
