@@ -16,6 +16,7 @@ optax = "^0.2.3"
 brax = "^0.10.5"
 matplotlib = "^3.9.2"
 wandb = "^0.17.8"
+tqdm = "^4.66.5"
 
 
 [build-system]

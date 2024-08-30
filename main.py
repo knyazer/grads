@@ -1,5 +1,3 @@
-import argparse
-import datetime
 import time
 from typing import Callable
 
@@ -9,17 +7,13 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 import jax.tree_util as jtu
-import optax
-from brax import envs
 
 
 class LogNormalDistribution(eqx.Module):
-    """Multivariate Log Normal distribution with diagonal covariance"""
-
     mean: jax.Array
     log_std: jax.Array
 
-    def __init__(self, mean, log_std):
+    def __init__(self, mean: jax.Array, log_std: jax.Array):
         self.mean = mean
         self.log_std = log_std
 
@@ -38,19 +32,14 @@ class LogNormalDistribution(eqx.Module):
         normalized = (value - self.mean) / jnp.exp(self.log_std)
         return jax.scipy.stats.norm.logpdf(normalized).sum()
 
-    def sample(self, key):
+    def sample(self, key: jr.PRNGKey):
         return jr.normal(key, self.mean.shape) * jnp.exp(self.log_std) + self.mean
 
     def entropy(self):
-        return self.log_std.sum() * 0.5  # entropy without constant factor
+        return self.log_std.sum() * 0.5
 
 
 class Evaluator:
-    """
-    Evaluates agent on the environment.
-    It is not jittable, since run_evaluation needs time.time()
-    """
-
     def __init__(self, eval_env, agent, num_eval_envs, episode_length):
         self._eval_walltime = 0.0
         self.eval_env = eval_env
@@ -59,9 +48,8 @@ class Evaluator:
         self._steps_per_unroll = episode_length * num_eval_envs
 
     @eqx.filter_jit
-    def evaluate(self, key, agent):
-        def actor_step(key, env_state, policy, extra_fields):
-            """Makes a single step with the provided policy in the environment."""
+    def evaluate(self, key: jr.PRNGKey, agent):
+        def actor_step(key: jr.PRNGKey, env_state, policy: Callable, extra_fields):
             keys_policy = jr.split(key, env_state.obs.shape[0])
             action = eqx.filter_vmap(policy)(env_state.obs, keys_policy)
             next_state = self.eval_env.step(env_state, action.transformed)
@@ -71,13 +59,12 @@ class Evaluator:
                 action=action,
                 reward=next_state.reward,
                 next_observation=next_state.obs,
-                # extract requested additional fields
                 extras={x: next_state.info[x] for x in extra_fields},
             )
 
-        def generate_unroll(key, env_state, policy, unroll_length, extra_fields):
-            """Collects trajectories of given unroll length."""
-
+        def generate_unroll(
+            key: jr.PRNGKey, env_state, policy: Callable, unroll_length, extra_fields
+        ):
             def f(carry, _):
                 current_key, state = carry
                 current_key, next_key = jr.split(current_key)
@@ -102,7 +89,9 @@ class Evaluator:
             extra_fields=("truncation",),
         )[0]
 
-    def run_evaluation(self, key, agent, training_metrics, aggregate_episodes=True):
+    def run_evaluation(
+        self, key: jr.PRNGKey, agent, training_metrics, aggregate_episodes: bool = True
+    ):
         t = time.time()
         eval_state = self.evaluate(key, agent)
         eval_metrics = eval_state.info["eval_metrics"]
@@ -127,25 +116,16 @@ class Evaluator:
 
 
 class Action(eqx.Module):
-    """
-    Action class represents a single action taken by an agent.
-    Additionally stores some useful data.
-
-    raw: action that was a direct output of an Actor-Critic model
-    transformed: action that was applied on the environment
-    distr: distribution from which raw action was sampled
-    """
-
-    raw: jax.Array
-    transformed: jax.Array
-    distr: LogNormalDistribution
+    raw: jax.Array = None
+    transformed: jax.Array = None
+    distr: LogNormalDistribution = None
 
     def __init__(self, raw, transformed, distr):
         self.raw = raw
         self.transformed = transformed
         self.distr = distr
 
-    def postprocess(self, apply):
+    def postprocess(self, apply: Callable):
         return Action(raw=self.raw, transformed=apply(self.transformed), distr=self.distr)
 
 
@@ -157,7 +137,7 @@ class ValueRange(eqx.Module):
 class MeanNetwork(eqx.Module):
     structure: list
 
-    def __init__(self, key, observation_size, action_size):
+    def __init__(self, key: jr.PRNGKey, observation_size: int, action_size: int):
         key1, key2, key3, key4 = jax.random.split(key, 4)
         self.structure = [
             eqx.nn.Linear(observation_size, 64, key=key1),
@@ -167,7 +147,6 @@ class MeanNetwork(eqx.Module):
             eqx.nn.Linear(64, action_size, key=key4),
         ]
 
-        # scaling down the weights of the output layer improves performance
         self.structure = eqx.tree_at(
             where=lambda s: s[-1].weight,
             pytree=self.structure,
@@ -182,12 +161,10 @@ class MeanNetwork(eqx.Module):
 
 class RunningMeanStd(eqx.Module):
     mean: jax.Array
-    M2: jax.Array  # sum of second moments of the samples (sum of variances)
+    M2: jax.Array
     n: jax.Array
     size: int = eqx.field(static=True)
 
-    # we are initializing n with two so that we don't get division by zero, ever
-    # this biases the running statistics, but not really that much
     def __init__(self, size, mean=None, M2=None, n=jnp.int32(2)):
         self.size = size
         self.mean = (jnp.zeros(size)) if mean is None else mean
@@ -203,18 +180,14 @@ class RunningMeanStd(eqx.Module):
                 "Standard deviation should have the same shape as the observation, "
                 + f"std shape is {std.shape} but observation shape is {obs.shape}",
             )
-            # error if std is complex or nan
             std = eqx.error_if(
                 std,
                 jnp.any(jnp.isnan(std)) | jnp.any(jnp.iscomplex(std)),
                 "Standard deviation should not be nan or complex",
             )
 
-        # clip std, so that we don't get extreme values
         std = jnp.clip(std, 1e-6, 1e6)
 
-        # clip the extreme outliers -> more stability during training.
-        # by Chebyshev inequality, ~99% of values are not clipped.
         processed = jnp.clip(
             (obs - jax.lax.stop_gradient(self.mean)) / jax.lax.stop_gradient(std), -10, 10
         )
@@ -245,24 +218,21 @@ class RunningMeanStd(eqx.Module):
 
 
 class Actor(eqx.Module):
-    """A module, that outputs action distribution for a particular state."""
-
     mean_network: MeanNetwork
-    log_std: jax.Array  # Trainable array
+    log_std: jax.Array
     normalizer: RunningMeanStd
     constraint: Callable
 
     def __init__(
         self,
-        key,
-        observation_size,
-        action_size,
-        initial_std=0.5,
+        key: jr.PRNGKey,
+        observation_size: int,
+        action_size: int,
+        initial_std: float = 0.5,
     ):
         self.mean_network = MeanNetwork(key, observation_size, action_size)
         self.log_std = jnp.ones((action_size,)) * jnp.log(initial_std)
         self.normalizer = RunningMeanStd(observation_size)
-        # tanh action constraint is applied by default
         self.constraint = lambda x: jnp.tanh(x)
 
     def __call__(self, x, key=None, eval=False):
@@ -273,18 +243,15 @@ class Actor(eqx.Module):
         return Action(raw=x, transformed=action, distr=distr)
 
     def get_trainable(self):
-        """Returns the PyTree of trainable parameters."""
         return eqx.filter(self, eqx.is_inexact_array)
 
 
 class Transition(eqx.Module):
-    """Represents a transition between two adjacent environment states."""
-
-    observation: jax.Array  # observation on the current state
-    action: Action  # action that was taken on the current state
-    reward: float  # reward, that was given as the result of the action
-    next_observation: jax.Array  # next observation
-    extras: dict  # any simulator-extracted hints, like end of the episode signal
+    observation: jax.Array
+    action: Action
+    reward: float
+    next_observation: jax.Array
+    extras: dict
 
     def __init__(self, observation, action, reward, next_observation, extras={}):
         self.observation = observation
@@ -294,71 +261,21 @@ class Transition(eqx.Module):
         self.extras = extras
 
 
-class Logger:
-    def __init__(self, *, use_wandb=False):
-        self.use_wandb = use_wandb
-        if self.use_wandb:
-            import wandb
+import optax
+from brax import envs
 
-            wandb.login()  # type:ignore
-            wandb.init(
-                project="masif2",
-                settings=wandb.Settings(code_dir="."),
-                save_code=True,
-                group="tpu",
-            )
-
-    def init(self, name, **kws):
-        if self.use_wandb:
-            import wandb
-
-            wandb.init(
-                name=name,
-                project="masif2",
-                settings=wandb.Settings(code_dir="."),
-                reinit=True,
-                group="tpu",
-                **kws,
-            )
-
-    def log(self, data):
-        if self.use_wandb:
-            import wandb
-
-            wandb.log(data)
-
-    def finish(self):
-        if self.use_wandb:
-            import wandb
-
-            wandb.finish()  # type:ignore
+jax.config.update("jax_log_compiles", True)
 
 
-wandb = Logger()
-
-
-def lyapunov_schedule(lyapunov_factor, epoch_index):
-    return lyapunov_factor
-
-
-def env_step(carry, step_index, epoch_index, zero_grad_agent=None, gradded_zero_agent=None):
+def env_step(carry, step_index: int, epoch_index: int, agent):
     env_state, key = carry
     key, key_sample = jax.random.split(key)
 
-    dyn_zero_grad, stat = eqx.partition(zero_grad_agent, eqx.is_array)
-    dyn_gradded_zero, _ = eqx.partition(gradded_zero_agent, eqx.is_array)
-
-    # truncate indicator
     mod = jnp.mod(step_index + 1, truncation_length)
-    lyapunov_multiplier = lyapunov_schedule(lyapunov_factor, epoch_index)
-    reward_multiplier = time_discount ** (mod - truncation_length)
+    lyapunov_multiplier = lyapunov_factor
 
-    dyn_combined = jtu.tree_map(lambda nograd, grad: nograd + grad, dyn_zero_grad, dyn_gradded_zero)
-    restored_agent = eqx.combine(dyn_combined, stat)
-
-    actions = eqx.filter_vmap(restored_agent)(env_state.obs, jax.random.split(key_sample, num_envs))
+    actions = eqx.filter_vmap(agent)(env_state.obs, jax.random.split(key_sample, num_envs))
     next_state = env.step(env_state, actions.transformed)
-    # stop the gradient for the next state, mul by luapunov schedule
     next_state_grad = jtu.tree_map(lambda x: x - jax.lax.stop_gradient(x), next_state)
     next_state = jtu.tree_map(
         lambda no_grad, grad: no_grad + grad * lyapunov_multiplier,
@@ -369,37 +286,26 @@ def env_step(carry, step_index, epoch_index, zero_grad_agent=None, gradded_zero_
     if truncation_length is not None:
         next_state = jax.lax.cond(mod == 0.0, jax.lax.stop_gradient, lambda x: x, next_state)
 
-    return (next_state, key), (next_state.reward * reward_multiplier, env_state.obs)
+    return (next_state, key), (next_state.reward, env_state.obs)
 
 
-def loss(agent, key=None, epoch_index=None):
+def loss(agent, key=None, epoch_index=None, env_state=None):
     assert epoch_index is not None
     assert key is not None
-    dyn, stat = eqx.partition(agent, eqx.is_array)
-    dyn_stopped = jtu.tree_map(lambda x: jax.lax.stop_gradient(x), dyn)
-    zero_grad_agent = eqx.combine(dyn_stopped, stat)
-    zero_dyn = jtu.tree_map(lambda d, d_stopped: d - d_stopped, dyn, dyn_stopped)
-    gradded_zero_agent = eqx.combine(zero_dyn, stat)
+    assert env_state is not None
 
     key_reset, key_scan = jax.random.split(key)
-    env_state = env.reset(jax.random.split(key_reset, num_envs))
 
-    _, (rewards, obs) = jax.lax.scan(
-        jax.tree_util.Partial(
-            env_step,
-            epoch_index=epoch_index,
-            zero_grad_agent=zero_grad_agent,
-            gradded_zero_agent=gradded_zero_agent,
-        ),
+    (end_state, _), (rewards, obs) = jax.lax.scan(
+        jax.tree_util.Partial(env_step, epoch_index=epoch_index, agent=agent),
         init=(env_state, key_scan),
-        xs=jnp.arange(episode_length),
-        length=episode_length,
+        xs=jnp.arange(truncation_length),
+        length=truncation_length,
     )
 
-    assert rewards.shape == (episode_length, num_envs)
+    assert rewards.shape == (truncation_length, num_envs)
 
-    # loss is (inverted) sum of the mean rewards
-    return -jnp.sum(jnp.mean(rewards, axis=1)), obs
+    return -jnp.sum(jnp.mean(rewards, axis=1)), (obs, end_state)
 
 
 loss_grad = eqx.filter_value_and_grad(loss, has_aux=True)
@@ -410,122 +316,104 @@ def training_epoch(agent, opt_state, key=None, optimizer=None, epoch_index=None)
     assert key is not None
     assert optimizer is not None
     assert epoch_index is not None
-    key, key_grad = jax.random.split(key)
-    (value, obs), grad = loss_grad(agent, key=key_grad, epoch_index=epoch_index)
-    params_update, new_opt_state = optimizer.update(grad, opt_state, agent)
-    # check the learning rate
-    new_agent = eqx.apply_updates(agent, params_update)
-    # update normalizer
-    new_normalizer = new_agent.normalizer.update_batched(obs.reshape((-1, env.observation_size)))
-    new_agent = eqx.tree_at(
-        where=lambda s: s.normalizer,
-        pytree=new_agent,
-        replace_fn=lambda _: new_normalizer,
+
+    agent_dyn, agent_st = eqx.partition(agent, eqx.is_array)
+
+    def train_trunc(carry, key):
+        agent_dyn, env_state, opt_state = carry
+        key, key_grad = jax.random.split(key)
+        agent = eqx.combine(agent_dyn, agent_st)
+        (value, (obs, world_state)), grad = loss_grad(
+            agent, key=key_grad, epoch_index=epoch_index, env_state=env_state
+        )
+        params_update, new_opt_state = optimizer.update(grad, opt_state, agent)
+        new_agent = eqx.apply_updates(agent, params_update)
+        new_normalizer = new_agent.normalizer.update_batched(
+            obs.reshape((-1, env.observation_size))
+        )
+        new_agent = eqx.tree_at(
+            where=lambda s: s.normalizer,
+            pytree=new_agent,
+            replace_fn=lambda _: new_normalizer,
+        )
+        agent_dyn2, agent_st2 = eqx.partition(new_agent, eqx.is_array)
+        return (agent_dyn2, world_state, new_opt_state), obs
+
+    key_reset, key_scan = jr.split(key, 2)
+    env_state = env.reset(jax.random.split(key_reset, num_envs))
+
+    (agent_dyn, _, opt_state), _ = jax.lax.scan(
+        train_trunc,
+        init=(agent_dyn, env_state, opt_state),
+        xs=jr.split(key_scan, episode_length // truncation_length),
+        length=episode_length // truncation_length,
     )
-    return new_agent, new_opt_state, obs
+
+    return eqx.combine(agent_dyn, agent_st), opt_state
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--size", default="small", choices=["small", "medium", "large"])
-    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
-    parser.add_argument(
-        "--n_hosts", type=int, default=1, help="Number of hosts for parallel execution"
-    )
-    parser.add_argument("--id", type=int, default=0, help="ID of the current host")
-    args = parser.parse_args()
+for lr in [3e-3]:
+    for lf in [0.88, 0.9, 0.92]:
+        env = envs.create(env_name="ant", backend="spring")
+        env = envs.training.wrap(env, episode_length=1000)
+        env = envs.training.EvalWrapper(env)
 
-    pfn_size = args.size
+        learning_rate = lr
+        truncation_length = 100
+        num_envs = 20
+        episode_length = 200
+        max_gradient_norm = 1.0
+        lyapunov_factor = lf
+        wd = 1e-6
+        num_epochs = 1200
 
-    wandb = Logger(use_wandb=args.wandb)
-    date = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=1))).strftime("%m%d")
-    for lr in [1e-4]:
-        for lf in [0.9]:
-            env = envs.create(env_name="ant", backend="spring")
-            env = envs.training.wrap(env, episode_length=1000)
-            env = envs.training.EvalWrapper(env)
-
-            learning_rate = lr
-            truncation_length = 100
-            num_envs = 40
-            episode_length = 400
-            max_gradient_norm = 1.0
-            lyapunov_factor = lf
-            wd = 1e-5
-            time_discount = 0.98
-            num_epochs = 1200
-
-            wandb.init(
-                project="grads",
-                save_code=True,
-                name=f"lr={learning_rate},tr={truncation_length},lf={lyapunov_factor},td={time_discount}",
-                config={
-                    "learning_rate": learning_rate,
-                    "truncation_length": truncation_length,
-                    "num_envs": num_envs,
-                    "episode_length": episode_length,
-                    "max_gradient_norm": max_gradient_norm,
-                    "lyapunov_factor": lyapunov_factor,
-                    "weight_decay": wd,
-                },
+        def run(env=env):
+            agent = Actor(
+                key=jr.PRNGKey(42),
+                observation_size=env.observation_size,
+                action_size=env.action_size,
             )
 
-            def run(env=env):
-                agent = Actor(
-                    key=jr.PRNGKey(42),
-                    observation_size=env.observation_size,
-                    action_size=env.action_size,
-                )
+            evaluator = Evaluator(
+                env,
+                agent,
+                num_eval_envs=num_envs,
+                episode_length=episode_length,
+            )
 
-                evaluator = Evaluator(
-                    env,
+            if isinstance(learning_rate, tuple):
+                lr_start, lr_end = learning_rate
+            else:
+                lr_start = learning_rate
+                lr_end = learning_rate
+            schedule = optax.cosine_decay_schedule(
+                init_value=lr_start, alpha=lr_end / lr_start, decay_steps=num_epochs
+            )
+
+            optimizer = optax.chain(
+                optax.clip(max_gradient_norm), optax.adamw(learning_rate=schedule, weight_decay=wd)
+            )
+            opt_state = optimizer.init(agent.get_trainable())
+
+            local_key = jr.PRNGKey(44)
+
+            metrics = {}
+            for it in range(num_epochs):
+                epoch_key, local_key = jax.random.split(local_key)
+                agent, opt_state = training_epoch(
                     agent,
-                    num_eval_envs=num_envs,
-                    episode_length=episode_length,
+                    opt_state,
+                    key=epoch_key,
+                    optimizer=optimizer,
+                    epoch_index=jnp.array(it, dtype=jnp.int32),
                 )
 
-                if isinstance(learning_rate, tuple):
-                    lr_start, lr_end = learning_rate
-                else:
-                    lr_start = learning_rate
-                    lr_end = learning_rate
-                schedule = optax.cosine_decay_schedule(
-                    init_value=lr_start, alpha=lr_end / lr_start, decay_steps=num_epochs
-                )
-
-                optimizer = optax.chain(
-                    optax.clip(max_gradient_norm),
-                    optax.adamw(learning_rate=schedule, weight_decay=wd),
-                )
-                opt_state = optimizer.init(agent.get_trainable())
-
-                local_key = jr.PRNGKey(44)
-
-                metrics = {}
-                for it in range(num_epochs):
-                    # optimization
-                    epoch_key, local_key = jax.random.split(local_key)
-                    agent, opt_state, other = training_epoch(
-                        agent,
-                        opt_state,
-                        key=epoch_key,
-                        optimizer=optimizer,
-                        epoch_index=jnp.array(it, dtype=jnp.int32),
+                if it % 10 == 3:
+                    metrics = evaluator.run_evaluation(
+                        agent=agent, training_metrics=metrics, key=jr.PRNGKey(42)
                     )
+                    print(f'reward {metrics["eval/episode_reward"]}')
 
-                    if it % 10 == 3:
-                        metrics = evaluator.run_evaluation(
-                            agent=agent, training_metrics=metrics, key=jr.PRNGKey(42)
-                        )
-                        print(f'reward {metrics["eval/episode_reward"]}')
-                        wandb.log(
-                            {
-                                "eval/episode_reward": metrics["eval/episode_reward"],
-                                "agent_log_std": agent.log_std.mean(),
-                                "lyapunov_factor": lyapunov_schedule(lyapunov_factor, it),
-                            }
-                        )
+            return agent, metrics
 
-                return agent, metrics
-
-            out = run()
+        out = run()
