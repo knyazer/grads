@@ -145,6 +145,8 @@ def training_epoch(
         length=episode_length // truncation_length,
     )
 
+    jax.debug.print("{}", losses)
+
     return eqx.combine(agent_dyn, agent_st), opt_state, -losses.sum()
 
 
@@ -166,25 +168,7 @@ num_envs = 20
 episode_length = 1000
 max_gradient_norm = 1.0
 lyapunov_factors = [
-    0.5,
-    0.6,
-    0.7,
-    0.8,
-    0.82,
-    0.84,
-    0.86,
-    0.88,
-    0.89,
     0.9,
-    0.91,
-    0.92,
-    0.93,
-    0.94,
-    0.95,
-    0.96,
-    0.97,
-    0.98,
-    0.99,
 ]
 n = len(lyapunov_factors)
 group_size = n // n_hosts
@@ -194,7 +178,7 @@ lyapunov_factors = lyapunov_factors[group_start:group_end]
 n = len(lyapunov_factors)
 print(f"Running with {lyapunov_factors}")
 num_epochs = 1000
-wandb = Logger(use_wandb=True)
+wandb = Logger(use_wandb=False)
 wandb.init(name=f"runs_{args.id}")
 
 
